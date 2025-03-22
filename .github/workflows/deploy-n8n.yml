@@ -1,0 +1,180 @@
+name: Deploy n8n to VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy-n8n:
+    runs-on: ubuntu-latest
+    
+    env:
+      VPS_IP: 51.222.29.215
+      N8N_PATH: /home/debian/n8n
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Create deployment files
+        run: |
+          # Create docker-compose.yml for n8n
+          cat > docker-compose.yml << 'EOF'
+          version: '3'
+          
+          services:
+            n8n:
+              image: docker.n8n.io/n8nio/n8n
+              container_name: n8n
+              restart: always
+              ports:
+                - "5678:5678"
+              environment:
+                - N8N_HOST=n8n.processgeniuspro.com
+                - N8N_PORT=5678
+                - N8N_PROTOCOL=https
+                - N8N_BASIC_AUTH_ACTIVE=true
+                - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+                - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+                - NODE_ENV=production
+                - WEBHOOK_URL=https://n8n.processgeniuspro.com/
+                - TZ=America/Toronto
+              volumes:
+                - n8n_data:/home/node/.n8n
+              networks:
+                - app_network
+          
+          volumes:
+            n8n_data:
+              external: true
+          
+          networks:
+            app_network:
+              name: app_network
+              external: true
+          EOF
+          
+          # Create nginx configuration for n8n subdomain
+          cat > nginx-n8n.conf << 'EOF'
+          server {
+              listen 80;
+              server_name n8n.processgeniuspro.com;
+              
+              # Redirect to HTTPS
+              location / {
+                  return 301 https://$host$request_uri;
+              }
+          }
+          
+          server {
+              listen 443 ssl;
+              server_name n8n.processgeniuspro.com;
+              
+              ssl_certificate /etc/letsencrypt/live/processgeniuspro.com/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/processgeniuspro.com/privkey.pem;
+              
+              # SSL settings
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_prefer_server_ciphers on;
+              ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384;
+              ssl_session_timeout 1d;
+              ssl_session_cache shared:SSL:50m;
+              
+              # Proxy to n8n container
+              location / {
+                  proxy_pass http://localhost:5678;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_buffering off;
+                  proxy_read_timeout 120s;
+              }
+          }
+          EOF
+          
+          # Create deployment script
+          cat > deploy-n8n.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "Starting n8n deployment..."
+          
+          # Load environment variables
+          set -a
+          source .env
+          set +a
+          
+          # Create Docker volume if it doesn't exist
+          echo "Creating Docker volume for n8n data..."
+          docker volume create n8n_data || echo "Volume already exists"
+          
+          # Create Docker network if it doesn't exist
+          echo "Creating Docker network if it doesn't exist..."
+          docker network create app_network || echo "Network already exists"
+          
+          # Stop and remove existing container if it exists
+          echo "Stopping existing n8n container if running..."
+          docker stop n8n || true
+          docker rm n8n || true
+          
+          # Start n8n with docker-compose
+          echo "Starting n8n container..."
+          docker-compose up -d
+          
+          # Set up Nginx configuration
+          echo "Setting up Nginx configuration..."
+          sudo mkdir -p /opt/apps/nginx/conf.d/
+          sudo cp nginx-n8n.conf /opt/apps/nginx/conf.d/n8n.conf
+          
+          # Check if Nginx is running in Docker or as a system service
+          if docker ps | grep -q nginx; then
+            echo "Reloading Nginx Docker container..."
+            docker exec nginx nginx -s reload || echo "Failed to reload Nginx in Docker, may need manual restart"
+          else
+            echo "Reloading Nginx system service..."
+            sudo systemctl reload nginx || echo "Failed to reload Nginx, may need manual restart"
+          fi
+          
+          echo "Waiting for n8n to start up..."
+          sleep 10
+          
+          echo "n8n deployment completed. Container status:"
+          docker ps | grep n8n
+          
+          echo "You can now access n8n at: https://n8n.processgeniuspro.com"
+          EOF
+          
+          chmod +x deploy-n8n.sh
+          
+          # Create .env file
+          cat > .env << 'EOF'
+          N8N_BASIC_AUTH_USER=admin
+          N8N_BASIC_AUTH_PASSWORD=strongpassword123
+          EOF
+      
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      
+      - name: Add host key to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ env.VPS_IP }} >> ~/.ssh/known_hosts
+      
+      - name: Deploy to VPS
+        run: |
+          # Create directory on VPS
+          ssh debian@${{ env.VPS_IP }} "mkdir -p ${{ env.N8N_PATH }}"
+          
+          # Copy deployment files to VPS
+          scp docker-compose.yml nginx-n8n.conf deploy-n8n.sh .env debian@${{ env.VPS_IP }}:${{ env.N8N_PATH }}/
+          
+          # Execute deployment script on VPS
+          ssh debian@${{ env.VPS_IP }} "cd ${{ env.N8N_PATH }} && chmod +x deploy-n8n.sh && ./deploy-n8n.sh"
